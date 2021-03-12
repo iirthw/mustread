@@ -1,0 +1,4 @@
+https://stackoverflow.com/questions/3992980/c-inline-member-function-in-cpp-file
+
+https://stackoverflow.com/questions/1208028/significance-of-a-inl-file-in-c
+https://software.intel.com/content/www/us/en/develop/articles/api-without-secrets-introduction-to-vulkan-part-1.html?countrylabel=Peru
