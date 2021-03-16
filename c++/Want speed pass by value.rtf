@@ -1,0 +1,131 @@
+{\rtf1\ansi\ansicpg1252\deff0\nouicompat\deflang1033{\fonttbl{\f0\fnil\fcharset0 Calibri;}{\f1\fnil Calibri;}{\f2\fnil\fcharset1 Segoe UI Symbol;}}
+{\*\generator Riched20 10.0.19041}\viewkind4\uc1 
+\pard\sa200\sl276\slmult1\b\f0\fs22\lang9 Want Speed? Pass by Value.\b0\par
+This entry is part of a series, RValue References: Moving Forward\'bb\par
+Be honest: how does the following code make you feel?\par
+\par
+std::vector<std::string> get_names();\par
+\'85\par
+std::vector<std::string> const names = get_names();\par
+Frankly, even though I should know better, it makes me nervous. In principle, when get_names() returns, we have to copy a vector of strings. Then, we need to copy it again when we initialize names, and we need to destroy the first copy. If there are N strings in the vector, each copy could require as many as N+1 memory allocations and a whole slew of cache-unfriendly data accesses as the string contents are copied.\par
+\par
+Rather than confront that sort of anxiety, I\rquote ve often fallen back on pass-by-reference to avoid needless copies:\par
+\par
+get_names(std::vector<std::string>& out_param );\par
+\'85\par
+std::vector<std::string> names;\par
+get_names( names );\par
+Unfortunately, this approach is far from ideal.\par
+\par
+The code grew by 150%\par
+We\rquote ve had to drop const-ness because we\rquote re mutating names.\par
+As functional programmers like to remind us, mutation makes code more complex to reason about by undermining referential transparency and equational reasoning.\par
+We no longer have strict value semantics1 for names.\par
+But is it really necessary to mess up our code in this way to gain efficiency? Fortunately, the answer turns out to be no (and especially not if you are using C++0x). This article is the first in a series that explores rvalues and their impliciations for efficient value semantics in C++.\par
+\par
+RValues\par
+Rvalues are expressions that create anonymous temporary objects. The name rvalue refers to the fact that an rvalue expression of builtin type can only appear on the right-hand side of an assignment. Unlike lvalues, which, when non-const, can always be used on the left-hand-side of an assignment, rvalue expressions yield objects without any persistent identity to assign into.2\par
+\par
+The important thing about anonymous temporaries for our purposes, though, is that they can only be used once in an expression. How could you possibly refer to such an object a second time? It doesn\rquote t have a name (thus, \ldblquote anonymous\rdblquote ); and after the full expression is evaluated, the object is destroyed (thus, \ldblquote temporary\rdblquote )!\par
+\par
+Once you know you are copying from an rvalue, then, it should be possible to \ldblquote steal\rdblquote  the expensive-to-copy resources from the source object and use them in the target object without anyone noticing. In this case that would mean transferring ownership of the source vector\rquote s dynamically-allocated array of strings to the target vector. If we could somehow get the compiler to execute that \ldblquote move\rdblquote  operation for us, it would be cheap\f1\endash almost free\endash to initialize names from a vector returned by-value.\par
+\par
+That would take care of the second expensive copy, but what about the first? When get_names returns, in principle, it has to copy the function\rquote s return value from the inside of the function to the outside. Well, it turns out that return values have the same property as anonymous temporaries: they are about to be destroyed, and won\rquote t be used again. So, we could eliminate the first expensive copy in the same way, transferring the resources from the return value on the inside of the function to the anonymous temporary seen by the caller.\par
+\par
+Copy Elision and the RVO\par
+The reason I kept writing above that copies were made \ldblquote in principle\rdblquote  is that the compiler is actually allowed to perform some optimizations based on the same principles we\rquote ve just discussed. This class of optimizations is known formally as copy elision. For example, in the Return Value Optimization (RVO), the calling function allocates space for the return value on its stack, and passes the address of that memory to the callee. The callee can then construct a return value directly into that space, which eliminates the need to copy from inside to outside. The copy is simply elided, or \ldblquote edited out,\rdblquote  by the compiler. So in code like the following, no copies are required:\par
+\par
+std::vector<std::string> names = get_names();\par
+Also, although the compiler is normally required to make a copy when a function parameter is passed by value (so modifications to the parameter inside the function can\rquote t affect the caller), it is allowed to elide the copy, and simply use the source object itself, when the source is an rvalue.\par
+\par
+std::vector<std::string> \par
+sorted(std::vector<std::string> names)\par
+\{\par
+    std::sort(names);\par
+    return names;\par
+\}\par
+ \par
+// names is an lvalue; a copy is required so we don't modify names\par
+std::vector<std::string> sorted_names1 = sorted( names );\par
+ \par
+// get_names() is an rvalue expression; we can omit the copy!\par
+std::vector<std::string> sorted_names2 = sorted( get_names() );\par
+This is pretty remarkable. In principle, in line 12 above, the compiler can eliminate all the worrisome copies, making sorted_names2 the same object as the one created in get_names(). In practice, though, the principle won\rquote t take us quite that far, as I\rquote ll explain later.\par
+\par
+Implications\par
+Although copy elision is never required by the standard, recent versions of every compiler I\rquote ve tested do perform these optimizations today. But even if you don\rquote t feel comfortable returning heavyweight objects by value, copy elision should still change the way you write code.\par
+\par
+Consider this cousin of our original sorted(\'85) function, which takes names by const reference and makes an explicit copy:\par
+\par
+std::vector<std::string> \par
+sorted2(std::vector<std::string> const& names) // names passed by reference\par
+\{\par
+    std::vector<std::string> r(names);        // and explicitly copied\par
+    std::sort(r);\par
+    return r;\par
+\}\par
+Although sorted and sorted2 seem at first to be identical, there could be a huge performance difference if a compiler does copy elision. Even if the actual argument to sorted2 is an rvalue, the source of the copy, names, is an lvalue,3 so the copy can\rquote t be optimized away. In a sense, copy elision is a victim of the separate compilation model: inside the body of sorted2, there\rquote s no information about whether the actual argument to the function is an rvalue; outside, at the call site, there\rquote s no indication that a copy of the argument will eventually be made.\par
+\par
+That realization leads us directly to this guideline:\par
+\par
+Guideline: Don\rquote t copy your function arguments. Instead, pass them by value and let the compiler do the copying.\par
+\par
+At worst, if your compiler doesn\rquote t elide copies, performance will be no worse. At best, you\rquote ll see an enormous performance boost.\par
+\par
+One place you can apply this guideline immediately is in assignment operators. The canonical, easy-to-write, always-correct, strong-guarantee, copy-and-swap assignment operator is often seen written this way:\par
+\par
+T& T::operator=(T const& x) // x is a reference to the source\par
+\{ \par
+    T tmp(x);          // copy construction of tmp does the hard work\par
+    swap(*this, tmp);  // trade our resources for tmp's\par
+    return *this;      // our (old) resources get destroyed with tmp \par
+\}\par
+but in light of copy elision, that formulation is glaringly inefficient! It\rquote s now \ldblquote obvious\rdblquote  that the correct way to write a copy-and-swap assignment is:\par
+\par
+T& operator=(T x)    // x is a copy of the source; hard work already done\par
+\{\par
+    swap(*this, x);  // trade our resources for x's\par
+    return *this;    // our (old) resources get destroyed with x\par
+\}\par
+Reality Bites\par
+Of course, lunch is never really free, so I have a couple of caveats.\par
+\par
+First, when you pass parameters by reference and copy in the function body, the copy constructor is called from one central location. However, when you pass parameters by value, the compiler generates calls to the copy constructor at the site of each call where lvalue arguments are passed. If the function will be called from many places and code size or locality are serious considerations for your application, it could have a real effect.\par
+\par
+On the other hand, it\rquote s easy to build a wrapper function that localizes the copy:\par
+\par
+std::vector<std::string> \par
+sorted3(std::vector<std::string> const& names)\par
+\{\par
+    // copy is generated once, at the site of this call\par
+    return sorted(names);\par
+\}\par
+Since the converse doesn\rquote t hold\emdash you can\rquote t get back a lost opportunity for copy elision by wrapping\emdash I recommend you start by following the guideline, and make changes only as you find them to be necessary.\par
+\par
+Second, I\rquote ve yet to find a compiler that will elide the copy when a function parameter is returned, as in our implementation of sorted. When you think about how these elisions are done, it makes sense: without some form of inter-procedural optimization, the caller of sorted can\rquote t know that the argument (and not some other object) will eventually be returned, so the compiler must allocate separate space on the stack for the argument and the return value.\par
+\par
+If you need to return a function parameter, you can still get near-optimal performance by swapping into a default-constructed return value (provided default construction and swap are cheap, as they should be):\par
+\par
+std::vector<std::string> \par
+sorted(std::vector<std::string> names)\par
+\{\par
+    std::sort(names);\par
+    std::vector<std::string> ret;\par
+    swap(ret, names);\par
+    return ret;\par
+\}\par
+More To Come\par
+Hopefully you now have the ammunition you need to stave off anxiety about passing and returning nontrivial objects by value. But we\rquote re not done yet: now that we\rquote ve covered rvalues, copy elision, and the RVO, we have all the background we need to attack move semantics, rvalue references, perfect forwarding, and more as we continue this article series. See you soon!\par
+\par
+Follow this link to the next installment.\par
+\par
+Acknowledgements\par
+Howard Hinnant is responsible for key insights that make this article series possible. Andrei Alexandrescu was posting on comp.lang.c++.moderated about how to leverage copy elision years before I took it seriously. Most of all, though, thanks in general to all readers and reviewers!\par
+\par
+Googling for a good definition of value semantics turned up nothing for me. Unless someone else can point to one (and maybe even if they can), we\rquote ll be running an article on that topic\emdash in which I promise you a definition\emdash soon. \f2\u8617?\f0\par
+\par
+For a detailed treatment of rvalues and lvalues, please see this excellent article by Dan Saks \f2\u8617?\f0\par
+\par
+Except for enums and non-type template parameters, every value with a name is an lvalue. \f2\u8617?\f0\par
+}
+ 
